@@ -30,6 +30,40 @@ def get_social_media_links(soup, company_url):
     
     return '; '.join(social_media) if social_media else ''
 
+def get_company_website(company_url):
+    """Пытается найти официальный сайт компании на странице компании"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(company_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Ищем ссылки на официальные сайты
+            website_patterns = [
+                'официальный сайт',
+                'сайт компании',
+                'www.',
+                'http://',
+                'https://'
+            ]
+            
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                text = link.get_text(strip=True).lower()
+                
+                # Проверяем, что это внешняя ссылка
+                if any(pattern in text for pattern in website_patterns) or href.startswith('http'):
+                    if not href.startswith('https://erzrf.ru') and not href.startswith('http://erzrf.ru'):
+                        return href
+            
+    except:
+        pass
+    
+    return ""
+
 def parse_companies_from_page(soup, headers):
     """Парсит данные о компаниях с одной страницы"""
     data = []
@@ -63,22 +97,32 @@ def parse_companies_from_page(soup, headers):
             else:
                 city = "Не указано"
             
-            # Пытаемся получить соцсети с сайта компании
-            social_media = ''
+            # Пытаемся найти официальный сайт компании
+            official_website = ""
+            social_media = ""
+            
             if company_url and company_url.startswith('http'):
                 try:
-                    time.sleep(0.3)  # Небольшая задержка между запросами
-                    company_response = requests.get(company_url, headers=headers, timeout=10)
-                    if company_response.status_code == 200:
-                        company_soup = BeautifulSoup(company_response.text, 'html.parser')
-                        social_media = get_social_media_links(company_soup, company_url)
+                    time.sleep(0.5)  # Небольшая задержка между запросами
+                    official_website = get_company_website(company_url)
+                    
+                    # Если нашли официальный сайт, пытаемся получить соцсети с него
+                    if official_website:
+                        try:
+                            time.sleep(0.5)
+                            website_response = requests.get(official_website, headers=headers, timeout=10)
+                            if website_response.status_code == 200:
+                                website_soup = BeautifulSoup(website_response.text, 'html.parser')
+                                social_media = get_social_media_links(website_soup, official_website)
+                        except:
+                            pass
                 except:
-                    pass  # Игнорируем ошибки при получении соцсетей
+                    pass
             
             data.append({
                 'Название': name,
                 'Город': city,
-                'Сайт': company_url,
+                'Сайт': official_website if official_website else company_url,
                 'Соцсети': social_media
             })
             
@@ -170,10 +214,17 @@ def main():
         df_companies = df_companies.head(250)
         
         # Сохраняем в Excel
-        output_file = 'top_250_realestate_companies.xlsx'
+        output_file = 'top_250_realestate_companies_final.xlsx'
         df_companies.to_excel(output_file, index=False)
         print(f"\nГотово! Данные сохранены в файл: {output_file}")
         print(f"Всего обработано компаний: {len(df_companies)}")
+        
+        # Показываем статистику
+        companies_with_website = df_companies[df_companies['Сайт'].notna() & (df_companies['Сайт'] != '')]
+        companies_with_social = df_companies[df_companies['Соцсети'].notna() & (df_companies['Соцсети'] != '')]
+        
+        print(f"Компаний с сайтами: {len(companies_with_website)}")
+        print(f"Компаний с соцсетями: {len(companies_with_social)}")
         
         # Показываем первые 5 записей
         print("\nПервые 5 компаний:")
