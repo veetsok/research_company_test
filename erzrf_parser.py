@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+Парсер для сайта erzrf.ru - извлечение данных о застройщиках
+Извлекает: название, город, сайт, соцсети
+"""
 
 import requests
-import csv
+from bs4 import BeautifulSoup
+import pandas as pd
 import time
 import re
-from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-import logging
-from typing import List, Dict, Optional
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('erzrf_parser.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+import json
 
 class ERZRFParser:
     def __init__(self):
@@ -34,221 +25,257 @@ class ERZRFParser:
         })
         self.base_url = 'https://erzrf.ru'
         self.companies_data = []
-
-    def get_page(self, url: str, retries: int = 3) -> Optional[BeautifulSoup]:
+        
+    def get_page(self, url, retries=3):
         """Получение страницы с повторными попытками"""
         for attempt in range(retries):
             try:
                 response = self.session.get(url, timeout=10)
                 response.raise_for_status()
-                response.encoding = 'utf-8'
-                return BeautifulSoup(response.text, 'html.parser')
+                return response
             except Exception as e:
-                logger.warning(f"Попытка {attempt + 1} не удалась для {url}: {e}")
+                print(f"Ошибка при получении {url} (попытка {attempt + 1}): {e}")
                 if attempt < retries - 1:
-                    time.sleep(2 ** attempt)  # Экспоненциальная задержка
+                    time.sleep(2)
                 else:
-                    logger.error(f"Не удалось получить страницу {url}")
                     return None
-
-    def parse_main_page(self, limit: int = 250) -> List[Dict]:
-        """Парсинг основной страницы с топом застройщиков"""
-        logger.info("Начинаем парсинг основной страницы...")
+        return None
+    
+    def extract_company_links_from_page(self, page_num):
+        """Извлечение ссылок на компании со страницы топа"""
+        url = f"{self.base_url}/top-zastroyshchikov/rf?regionKey=0&topType=0&date=250801&page={page_num}"
+        print(f"Парсинг страницы {page_num}: {url}")
         
-        # URL для получения топ застройщиков (с параметрами из задачи)
-        url = f"{self.base_url}/top-zastroyshchikov/rf?regionKey=0&topType=0&date=250801"
-        
-        soup = self.get_page(url)
-        if not soup:
-            logger.error("Не удалось получить основную страницу")
+        response = self.get_page(url)
+        if not response:
             return []
-
-        companies = []
         
-        # Поиск таблицы с застройщиками
-        table_rows = soup.find_all('tr') if soup else []
+        soup = BeautifulSoup(response.content, 'html.parser')
+        company_links = []
         
-        for i, row in enumerate(table_rows[:limit]):  # Ограничиваем топ-250
-            try:
-                # Поиск ссылки на застройщика
-                company_link = row.find('a')
-                if not company_link:
-                    continue
-                    
-                company_name = company_link.get_text(strip=True)
-                company_url = urljoin(self.base_url, company_link.get('href', ''))
-                
-                # Извлечение региона из текста строки
-                region_text = row.get_text()
-                region = self.extract_region(region_text)
-                
-                company_data = {
-                    'rank': i + 1,
-                    'name': company_name,
-                    'region': region,
-                    'profile_url': company_url,
-                    'website': '',
-                    'social_networks': ''
-                }
-                
-                companies.append(company_data)
-                logger.info(f"Найден застройщик #{i+1}: {company_name}")
-                
-            except Exception as e:
-                logger.error(f"Ошибка при парсинге строки {i}: {e}")
-                continue
-                
-        logger.info(f"Найдено {len(companies)} застройщиков на основной странице")
-        return companies
-
-    def extract_region(self, text: str) -> str:
-        """Извлечение региона из текста"""
-        # Регулярное выражение для поиска региона
-        region_patterns = [
-            r'г\.([А-Я][а-я\-]+)',  # г.Москва
-            r'([А-Я][а-я\-]+ область)',  # Московская область
-            r'([А-Я][а-я\-]+ край)',  # Краснодарский край
-            r'Республика ([А-Я][а-я\-]+)',  # Республика Татарстан
+        # Ищем ссылки на карточки компаний
+        # Обычно они в таблице или списке
+        links = soup.find_all('a', href=re.compile(r'/zastroyschiki/brand/'))
+        
+        for link in links:
+            href = link.get('href')
+            if href:
+                full_url = urljoin(self.base_url, href)
+                company_links.append(full_url)
+        
+        print(f"Найдено {len(company_links)} компаний на странице {page_num}")
+        return company_links
+    
+    def extract_company_data(self, company_url):
+        """Извлечение данных о компании из её карточки"""
+        print(f"Парсинг компании: {company_url}")
+        
+        response = self.get_page(company_url)
+        if not response:
+            return None
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        company_data = {
+            'название': '',
+            'город': '',
+            'сайт': '',
+            'соцсети': '',
+            'url_карточки': company_url
+        }
+        
+        # Извлечение названия компании
+        title_selectors = [
+            'h1',
+            '.company-name',
+            '.org-name',
+            '[class*="title"]',
+            '[class*="name"]'
         ]
         
-        for pattern in region_patterns:
-            match = re.search(pattern, text)
+        for selector in title_selectors:
+            title_elem = soup.select_one(selector)
+            if title_elem and title_elem.get_text(strip=True):
+                company_data['название'] = title_elem.get_text(strip=True)
+                break
+        
+        # Извлечение города
+        # Ищем в различных местах где может быть указан город
+        city_patterns = [
+            r'г\.\s*([А-Яа-яё\s\-]+)',
+            r'город\s+([А-Яа-яё\s\-]+)',
+            r'([А-Яа-яё\s\-]+)\s*область',
+        ]
+        
+        text_content = soup.get_text()
+        for pattern in city_patterns:
+            match = re.search(pattern, text_content, re.IGNORECASE)
             if match:
-                return match.group(1) if 'г\.' in pattern else match.group(0)
+                company_data['город'] = match.group(1).strip()
+                break
         
-        return "Не указан"
-
-    def parse_company_details(self, company: Dict) -> Dict:
-        """Парсинг детальной информации о компании"""
-        logger.info(f"Парсинг деталей для {company['name']}")
+        # Извлечение сайта
+        site_div = soup.find('div', id='org-site')
+        if site_div:
+            site_link = site_div.find('a')
+            if site_link:
+                href = site_link.get('href')
+                if href:
+                    company_data['сайт'] = href
         
-        soup = self.get_page(company['profile_url'])
-        if not soup:
-            return company
-            
-        try:
-            # Поиск официального сайта
-            website_links = soup.find_all('a', href=True)
-            for link in website_links:
-                href = link.get('href', '')
-                if self.is_company_website(href):
-                    company['website'] = href
-                    break
-            
-            # Поиск социальных сетей
-            social_links = []
-            social_patterns = [
-                r'vk\.com',
-                r'instagram\.com',
-                r'facebook\.com',
-                r't\.me',
-                r'youtube\.com',
-                r'ok\.ru'
+        # Если не нашли в org-site, ищем другими способами
+        if not company_data['сайт']:
+            # Ищем ссылки которые могут быть сайтами
+            site_selectors = [
+                'a[href*="http"]:contains("Сайт")',
+                'a[href*="http"]:contains("сайт")',
+                '.site a',
+                '.website a'
             ]
             
-            for link in website_links:
-                href = link.get('href', '')
-                for pattern in social_patterns:
-                    if re.search(pattern, href, re.IGNORECASE):
-                        social_links.append(href)
+            for selector in site_selectors:
+                try:
+                    site_elem = soup.select_one(selector)
+                    if site_elem:
+                        href = site_elem.get('href')
+                        if href and not 'erzrf.ru' in href:
+                            company_data['сайт'] = href
+                            break
+                except:
+                    continue
+        
+        # Извлечение соцсетей
+        social_networks = []
+        
+        # Ищем блок с соцсетями
+        social_div = soup.find('app-org-social') or soup.find(id='org-social')
+        if social_div:
+            social_links = social_div.find_all('a', href=True)
+            for link in social_links:
+                href = link.get('href')
+                if href and any(social in href.lower() for social in ['vk.com', 'facebook', 'instagram', 'twitter', 'telegram', 'youtube']):
+                    social_networks.append(href)
+        
+        # Если не нашли в специальном блоке, ищем по всей странице
+        if not social_networks:
+            all_links = soup.find_all('a', href=True)
+            for link in all_links:
+                href = link.get('href')
+                if href:
+                    social_domains = ['vk.com', 'facebook.com', 'instagram.com', 'twitter.com', 't.me', 'youtube.com']
+                    for domain in social_domains:
+                        if domain in href.lower():
+                            social_networks.append(href)
+                            break
+        
+        company_data['соцсети'] = '; '.join(social_networks) if social_networks else ''
+        
+        # Дополнительная попытка найти город из адреса или контактов
+        if not company_data['город']:
+            contact_sections = soup.find_all(['div', 'span', 'p'], text=re.compile(r'[Аа]дрес|[Кк]онтакт|[Гг]ород'))
+            for section in contact_sections:
+                text = section.get_text()
+                for pattern in city_patterns:
+                    match = re.search(pattern, text, re.IGNORECASE)
+                    if match:
+                        company_data['город'] = match.group(1).strip()
                         break
-            
-            company['social_networks'] = '; '.join(list(set(social_links)))
-            
-        except Exception as e:
-            logger.error(f"Ошибка при парсинге деталей для {company['name']}: {e}")
+                if company_data['город']:
+                    break
         
-        # Задержка между запросами
-        time.sleep(1)
-        return company
-
-    def is_company_website(self, url: str) -> bool:
-        """Проверка, является ли ссылка официальным сайтом компании"""
-        if not url or url.startswith('#') or 'erzrf.ru' in url:
-            return False
-            
-        # Исключаем социальные сети и другие сервисы
-        excluded_domains = [
-            'vk.com', 'instagram.com', 'facebook.com', 't.me',
-            'youtube.com', 'ok.ru', 'twitter.com', 'linkedin.com',
-            'google.com', 'yandex.ru', 'mail.ru'
-        ]
+        return company_data
+    
+    def parse_all_pages(self, max_pages=15):
+        """Парсинг всех страниц топа"""
+        print("Начинаем парсинг всех страниц...")
         
-        for domain in excluded_domains:
-            if domain in url.lower():
-                return False
-                
-        return url.startswith('http')
-
-    def save_to_csv(self, filename: str = 'top_250_zastroyshchiki.csv'):
-        """Сохранение данных в CSV файл"""
+        all_company_links = []
+        
+        # Собираем ссылки со всех страниц
+        for page_num in range(1, max_pages + 1):
+            links = self.extract_company_links_from_page(page_num)
+            if not links:
+                print(f"Страница {page_num} пуста, завершаем сбор ссылок")
+                break
+            all_company_links.extend(links)
+            time.sleep(1)  # Пауза между запросами
+        
+        print(f"Всего найдено {len(all_company_links)} компаний")
+        
+        # Удаляем дубликаты
+        all_company_links = list(set(all_company_links))
+        print(f"Уникальных компаний: {len(all_company_links)}")
+        
+        # Парсим данные каждой компании
+        for i, company_url in enumerate(all_company_links, 1):
+            print(f"\nОбрабатываем компанию {i}/{len(all_company_links)}")
+            
+            company_data = self.extract_company_data(company_url)
+            if company_data:
+                self.companies_data.append(company_data)
+                print(f"Добавлена: {company_data['название']}")
+            
+            # Пауза между запросами
+            time.sleep(1)
+            
+            # Промежуточное сохранение каждые 10 компаний
+            if i % 10 == 0:
+                self.save_to_excel(f'companies_backup_{i}.xlsx')
+        
+        return self.companies_data
+    
+    def save_to_excel(self, filename='companies.xlsx'):
+        """Сохранение данных в Excel"""
         if not self.companies_data:
-            logger.warning("Нет данных для сохранения")
-            return
-            
-        logger.info(f"Сохранение {len(self.companies_data)} записей в {filename}")
-        
-        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['rank', 'name', 'region', 'website', 'social_networks', 'profile_url']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
-            writer.writeheader()
-            for company in self.companies_data:
-                writer.writerow({
-                    'rank': company['rank'],
-                    'name': company['name'],
-                    'region': company['region'],
-                    'website': company['website'],
-                    'social_networks': company['social_networks'],
-                    'profile_url': company['profile_url']
-                })
-        
-        logger.info(f"Данные успешно сохранены в {filename}")
-
-    def run(self, limit: int = 250, parse_details: bool = True):
-        """Основной метод запуска парсера"""
-        logger.info(f"Запуск парсера для топ-{limit} застройщиков")
-        
-        # Получаем список компаний с основной страницы
-        companies = self.parse_main_page(limit)
-        
-        if not companies:
-            logger.error("Не удалось получить список компаний")
+            print("Нет данных для сохранения")
             return
         
-        self.companies_data = companies
+        df = pd.DataFrame(self.companies_data)
+        df.to_excel(filename, index=False, engine='openpyxl')
+        print(f"Данные сохранены в {filename}")
+        print(f"Всего компаний: {len(df)}")
         
-        # Парсим детальную информацию для каждой компании
-        if parse_details:
-            logger.info("Начинаем парсинг детальной информации...")
-            for i, company in enumerate(self.companies_data):
-                logger.info(f"Обрабатываем {i+1}/{len(self.companies_data)}: {company['name']}")
-                self.companies_data[i] = self.parse_company_details(company)
-                
-                # Прогресс каждые 10 компаний
-                if (i + 1) % 10 == 0:
-                    logger.info(f"Обработано {i+1} из {len(self.companies_data)} компаний")
+        # Показываем статистику
+        print(f"Компаний с сайтами: {df['сайт'].notna().sum()}")
+        print(f"Компаний с соцсетями: {df[df['соцсети'] != ''].shape[0]}")
+        print(f"Компаний с городами: {df['город'].notna().sum()}")
+    
+    def save_to_csv(self, filename='companies.csv'):
+        """Сохранение данных в CSV"""
+        if not self.companies_data:
+            print("Нет данных для сохранения")
+            return
         
-        # Сохраняем результаты
-        self.save_to_csv()
-        logger.info("Парсинг завершен!")
+        df = pd.DataFrame(self.companies_data)
+        df.to_csv(filename, index=False, encoding='utf-8-sig')
+        print(f"Данные сохранены в {filename}")
 
 def main():
     parser = ERZRFParser()
     
+    print("Запуск парсера ERZRF.ru")
+    print("Будем парсить топ застройщиков...")
+    
     try:
-        # Запускаем парсер для топ-250 компаний
-        parser.run(limit=250, parse_details=True)
+        # Парсим все страницы
+        companies = parser.parse_all_pages(max_pages=15)  # 250 компаний ≈ 13 страниц
+        
+        # Сохраняем результаты
+        parser.save_to_excel('erzrf_companies.xlsx')
+        parser.save_to_csv('erzrf_companies.csv')
+        
+        print(f"\nПарсинг завершен! Обработано {len(companies)} компаний")
         
     except KeyboardInterrupt:
-        logger.info("Парсинг прерван пользователем")
+        print("\nПарсинг прерван пользователем")
         if parser.companies_data:
-            parser.save_to_csv('partial_results.csv')
-            
+            parser.save_to_excel('erzrf_companies_partial.xlsx')
+            print("Частичные данные сохранены")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+        print(f"Ошибка: {e}")
         if parser.companies_data:
-            parser.save_to_csv('error_results.csv')
+            parser.save_to_excel('erzrf_companies_error.xlsx')
+            print("Данные сохранены до ошибки")
 
 if __name__ == "__main__":
     main()
