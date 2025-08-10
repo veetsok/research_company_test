@@ -1,0 +1,5 @@
+telethon==1.36.0
+typer==0.12.3
+click==8.1.7
+rich==13.7.1
+python-dotenv==1.0.1
